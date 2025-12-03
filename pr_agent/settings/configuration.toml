@@ -398,7 +398,7 @@ pr_commands = [
 [brain]
 mcp_enable = true
 mcp_bin = "/opt/prism-rust/target/release/brain-mcp"
-mcp_root = "/opt/prism-rust"
+mcp_root = "." # Changed to repo root
 mcp_default_slice = "runtime"
 mcp_timeout_seconds = 6.0
 mcp_max_modules = 5
