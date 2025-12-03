@@ -139,7 +139,7 @@ async def _perform_commands_gitea(commands_conf: str, agent: PRAgent, body: dict
 
     # --- Brain MCP Integration ---
     try:
-        if get_settings().get("brain.enable", False):
+        if get_settings().get("brain.mcp_enable", False):
             # Extract PR details
             pr = body.get("pull_request", {})
             pr_number = pr.get("number")
@@ -158,9 +158,12 @@ async def _perform_commands_gitea(commands_conf: str, agent: PRAgent, body: dict
                 changed_files = [f.get("filename") for f in changed_files_data if f.get("filename")]
 
                 # Prepare context
+                # mcp_root is the repo root (e.g., /opt/prism-rust)
+                # We use it both as the repo_path for writing BRAIN_QODO_CONTEXT.md
+                # and the client will derive .brain from it
                 mcp_root = get_settings().get("brain.mcp_root")
                 if mcp_root:
-                    repo_path = Path(mcp_root)
+                    repo_path = Path(mcp_root)  # Repo root, not .brain
                     pr_meta = PRMetadata(
                         pr_number=pr_number,
                         head_sha=head_sha,

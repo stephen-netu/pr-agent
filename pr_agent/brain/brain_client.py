@@ -11,16 +11,17 @@ from pr_agent.config_loader import get_settings
 logger = logging.getLogger(__name__)
 
 class BrainMCPClient:
-    def __init__(self, binary_path: Path, brain_root: Path):
+    def __init__(self, binary_path: Path, mcp_root: Path):
         self.binary_path = binary_path
-        self.brain_root = brain_root
+        self.mcp_root = mcp_root
+        self.brain_root = mcp_root / ".brain"
         self.proc: Optional[subprocess.Popen] = None
         self._next_id = 1
         self._start()
 
     def _start(self):
         env = os.environ.copy()
-        env["BRAIN_ROOT"] = str(self.brain_root)
+        env["BRAIN_ROOT"] = str(self.brain_root)  # Points to mcp_root/.brain
 
         try:
             self.proc = subprocess.Popen(
@@ -120,9 +121,9 @@ class BrainClientWrapper:
 
     def __init__(self):
         self.settings = get_settings()
-        self.mcp_bin = Path(self.settings.brain.mcp_bin)
-        self.mcp_root = Path(self.settings.brain.mcp_root)
-        self.timeout = self.settings.brain.mcp_timeout_seconds
+        self.mcp_bin = Path(self.settings.brain.get('mcp_bin', '/opt/prism-rust/target/release/brain-mcp'))
+        self.mcp_root = Path(self.settings.brain.get('mcp_root', '/opt/prism-rust'))
+        self.timeout = self.settings.brain.get('mcp_timeout_seconds', 6.0)
         self.client: Optional[BrainMCPClient] = None
 
     async def __aenter__(self):

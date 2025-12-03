@@ -36,7 +36,7 @@ async def prepare_brain_context(
     4. Return extra_instructions.
     """
     settings = get_settings()
-    if not settings.brain.enable:
+    if not settings.brain.get('mcp_enable', False):
         return BrainContextResult(status="unavailable", extra_instructions="")
 
     context_file = repo_path / "BRAIN_QODO_CONTEXT.md"
@@ -57,7 +57,7 @@ async def prepare_brain_context(
             # Let's call the tool directly via _call_tool_safe to pass 'paths'.
 
             change_impact = await client._call_tool_safe("get_change_impact", {
-                "slice": settings.brain.default_slice,
+                "slice": settings.brain.get('mcp_default_slice', 'runtime'),
                 "paths": pr_meta.changed_files,
                 "dependency_depth": 1,
                 "dependents_depth": 1
@@ -68,7 +68,7 @@ async def prepare_brain_context(
                 impacted_modules = change_impact["impacted_modules"]
 
             # Limit modules
-            max_modules = settings.brain.max_modules
+            max_modules = settings.brain.get('mcp_max_modules', 5)
             top_modules = impacted_modules[:max_modules]
 
             # 2. Get CI and Validation Status
@@ -78,8 +78,8 @@ async def prepare_brain_context(
             # 3. Get Details for Top Modules
             module_details = []
             for mod_id in top_modules:
-                contract = await client.get_module_contract(mod_id, settings.brain.default_slice)
-                risks = await client.get_module_risks(mod_id, settings.brain.default_slice)
+                contract = await client.get_module_contract(mod_id, settings.brain.get('mcp_default_slice', 'runtime'))
+                risks = await client.get_module_risks(mod_id, settings.brain.get('mcp_default_slice', 'runtime'))
                 module_details.append({
                     "id": mod_id,
                     "contract": contract,
@@ -92,14 +92,14 @@ async def prepare_brain_context(
                 ci_summary,
                 validation_status,
                 module_details,
-                settings.brain.max_risks
+                settings.brain.get('mcp_max_risks', 8)
             )
 
             instructions = _generate_instructions(
                 ci_summary,
                 validation_status,
                 module_details,
-                settings.brain.max_risks
+                settings.brain.get('mcp_max_risks', 8)
             )
 
             # Write file
