@@ -394,3 +394,13 @@ pr_commands = [
     "/review",
     "/improve",
 ]
+
+[brain]
+mcp_timeout_seconds = 6.0
+max_modules = 5
+max_risks = 8
+max_jobs = 6
+default_slice = "runtime"
+enable = true
+mcp_bin = "/opt/prism-rust/target/release/brain-mcp"
+mcp_root = "/opt/prism-rust/.brain"

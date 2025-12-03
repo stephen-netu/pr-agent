@@ -11,9 +11,11 @@ from starlette_context.middleware import RawContextMiddleware
 
 from pr_agent.agent.pr_agent import PRAgent
 from pr_agent.algo.utils import update_settings_from_args
-from pr_agent.config_loader import get_settings, global_settings
+from pr_agent.brain.bridge import prepare_brain_context, PRMetadata
+from pr_agent.config_loader import get_settings
+from pr_agent.git_providers.gitea_provider import GiteaProvider
 from pr_agent.git_providers.utils import apply_repo_settings
-from pr_agent.log import LoggingFormat, get_logger, setup_logger
+from pr_agent.log import get_loggeringFormat, get_logger, setup_logger
 from pr_agent.servers.utils import verify_signature
 
 # Setup logging and router
@@ -134,6 +136,52 @@ async def _perform_commands_gitea(commands_conf: str, agent: PRAgent, body: dict
         return
     if not should_process_pr_logic(body): # Here we already updated the configuration with the repo settings
         return {}
+
+    # --- Brain MCP Integration ---
+    try:
+        if get_settings().get("brain.enable", False):
+            # Extract PR details
+            pr = body.get("pull_request", {})
+            pr_number = pr.get("number")
+            head_sha = pr.get("head", {}).get("sha")
+            base_sha = pr.get("base", {}).get("sha")
+
+            # Fetch changed files using GiteaProvider
+            # We use a temporary provider instance just to get files
+            tmp_provider = GiteaProvider(api_url)
+            # GiteaProvider.get_change_file_pull_request returns list of dicts with 'filename'
+            # We need to parse owner/repo from api_url or body
+            repo_full_name = body.get("repository", {}).get("full_name", "")
+            if repo_full_name and "/" in repo_full_name:
+                owner, repo = repo_full_name.split("/", 1)
+                changed_files_data = tmp_provider.get_change_file_pull_request(owner, repo, pr_number)
+                changed_files = [f.get("filename") for f in changed_files_data if f.get("filename")]
+
+                # Prepare context
+                mcp_root = get_settings().get("brain.mcp_root")
+                if mcp_root:
+                    repo_path = Path(mcp_root)
+                    pr_meta = PRMetadata(
+                        pr_number=pr_number,
+                        head_sha=head_sha,
+                        base_sha=base_sha,
+                        changed_files=changed_files
+                    )
+
+                    get_logger().info(f"Preparing Brain context for PR #{pr_number}")
+                    brain_result = await prepare_brain_context(pr_meta, repo_path, "pull_request")
+
+                    if brain_result.extra_instructions:
+                        get_logger().info("Injecting Brain extra instructions")
+                        # Append to existing instructions for relevant tools
+                        for tool in ["pr_reviewer", "pr_code_suggestions"]:
+                            current = get_settings().get(f"{tool}.extra_instructions", "")
+                            new_instr = f"{current}\n\n{brain_result.extra_instructions}"
+                            get_settings().set(f"{tool}.extra_instructions", new_instr)
+    except Exception as e:
+        get_logger().error(f"Failed to prepare Brain context: {e}")
+    # -----------------------------
+
     commands = get_settings().get(f"gitea.{commands_conf}")
     if not commands:
         get_logger().info(f"New PR, but no auto commands configured")
