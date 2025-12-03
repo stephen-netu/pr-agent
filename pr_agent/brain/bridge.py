@@ -36,7 +36,11 @@ async def prepare_brain_context(
     4. Return extra_instructions.
     """
     settings = get_settings()
-    if not settings.brain.get('mcp_enable', False):
+    # Dynaconf exposes [brain] config as an object with attributes like
+    # brain.mcp_enable, brain.mcp_default_slice, etc.
+    mcp_enable = getattr(settings.brain, "mcp_enable", False)
+    if not mcp_enable:
+        # Bridge is explicitly disabled via config; do not attempt to talk to Brain MCP
         return BrainContextResult(status="unavailable", extra_instructions="")
 
     context_file = repo_path / "BRAIN_QODO_CONTEXT.md"
@@ -47,28 +51,25 @@ async def prepare_brain_context(
                 return _handle_unavailable(context_file, "Brain MCP client failed to initialize")
 
             # 1. Get Change Impact (to find modules)
-            # We assume changed_files are relative to repo root.
-            # Brain MCP expects paths relative to repo root.
-            # We use a heuristic: map files to modules via get_change_impact
-            # Note: get_change_impact takes module_ids OR paths. We use paths if available.
-            # But the spec says "Determine impacted modules... by calling Brain MCP tools".
-            # The current brain_client.py get_change_impact helper expects module_ids.
-            # We should probably update brain_client.py or call the tool directly if we want to pass paths.
-            # Let's call the tool directly via _call_tool_safe to pass 'paths'.
+            # We assume changed_files are relative to repo root, which is what Brain MCP expects.
+            default_slice = getattr(settings.brain, "mcp_default_slice", "runtime")
 
-            change_impact = await client._call_tool_safe("get_change_impact", {
-                "slice": settings.brain.get('mcp_default_slice', 'runtime'),
-                "paths": pr_meta.changed_files,
-                "dependency_depth": 1,
-                "dependents_depth": 1
-            })
+            change_impact = await client._call_tool_safe(
+                "get_change_impact",
+                {
+                    "slice": default_slice,
+                    "paths": pr_meta.changed_files,
+                    "dependency_depth": 1,
+                    "dependents_depth": 1,
+                },
+            )
 
             impacted_modules = []
             if change_impact and "impacted_modules" in change_impact:
                 impacted_modules = change_impact["impacted_modules"]
 
             # Limit modules
-            max_modules = settings.brain.get('mcp_max_modules', 5)
+            max_modules = getattr(settings.brain, "mcp_max_modules", 5)
             top_modules = impacted_modules[:max_modules]
 
             # 2. Get CI and Validation Status
@@ -78,28 +79,30 @@ async def prepare_brain_context(
             # 3. Get Details for Top Modules
             module_details = []
             for mod_id in top_modules:
-                contract = await client.get_module_contract(mod_id, settings.brain.get('mcp_default_slice', 'runtime'))
-                risks = await client.get_module_risks(mod_id, settings.brain.get('mcp_default_slice', 'runtime'))
+                contract = await client.get_module_contract(mod_id, default_slice)
+                risks = await client.get_module_risks(mod_id, default_slice)
                 module_details.append({
                     "id": mod_id,
                     "contract": contract,
-                    "risks": risks
+                    "risks": risks,
                 })
 
             # 4. Generate Content
+            max_risks = getattr(settings.brain, "mcp_max_risks", 8)
+
             markdown_content = _generate_markdown(
                 pr_meta.pr_number,
                 ci_summary,
                 validation_status,
                 module_details,
-                settings.brain.get('mcp_max_risks', 8)
+                max_risks,
             )
 
             instructions = _generate_instructions(
                 ci_summary,
                 validation_status,
                 module_details,
-                settings.brain.get('mcp_max_risks', 8)
+                max_risks,
             )
 
             # Write file

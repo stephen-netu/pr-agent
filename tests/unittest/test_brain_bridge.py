@@ -9,10 +9,10 @@ from pr_agent.brain.bridge import BrainContextResult, PRMetadata, prepare_brain_
 @pytest.fixture
 def mock_settings():
     with patch("pr_agent.brain.bridge.get_settings") as mock:
-        mock.return_value.brain.enable = True
-        mock.return_value.brain.default_slice = "runtime"
-        mock.return_value.brain.max_modules = 2
-        mock.return_value.brain.max_risks = 2
+        mock.return_value.brain.mcp_enable = True
+        mock.return_value.brain.mcp_default_slice = "runtime"
+        mock.return_value.brain.mcp_max_modules = 2
+        mock.return_value.brain.mcp_max_risks = 2
         yield mock
 
 @pytest.fixture
@@ -99,7 +99,7 @@ async def test_prepare_brain_context_partial(mock_settings, mock_brain_client, t
 
 @pytest.mark.asyncio
 async def test_disabled(mock_settings, tmp_path):
-    mock_settings.return_value.brain.enable = False
+    mock_settings.return_value.brain.mcp_enable = False
 
     pr_meta = PRMetadata(1, "a", "b", [])
     result = await prepare_brain_context(pr_meta, tmp_path, "pull_request")
