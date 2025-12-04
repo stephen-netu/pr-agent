@@ -1,8 +1,9 @@
+import asyncio
 import copy
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from starlette.background import BackgroundTasks
@@ -13,6 +14,7 @@ from starlette_context.middleware import RawContextMiddleware
 from pr_agent.agent.pr_agent import PRAgent
 from pr_agent.algo.utils import update_settings_from_args
 from pr_agent.brain.bridge import prepare_brain_context, PRMetadata
+from pr_agent.brain.chat_handlers import handle_next_actions_query, handle_status_query
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.gitea_provider import GiteaProvider
 from pr_agent.git_providers.utils import apply_repo_settings
@@ -22,6 +24,20 @@ from pr_agent.servers.utils import verify_signature
 # Setup logging and router
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
 router = APIRouter()
+
+BRAIN_STATUS_COMMANDS = {
+    "/brain status",
+    "/brain health",
+    "what's the state?",
+    "what's the state of the repo?",
+    "whats the state?",
+}
+BRAIN_NEXT_COMMANDS = {
+    "/brain next",
+    "/brain actions",
+    "what should i fix?",
+    "what should i fix next?",
+}
 
 @router.post("/api/v1/gitea_webhooks")
 async def handle_gitea_webhooks(background_tasks: BackgroundTasks, request: Request, response: Response):
@@ -146,7 +162,14 @@ async def handle_comment_event(body: Dict[str, Any], event: str, action: str, ag
         return
 
     comment_body = comment.get("body", "")
-    if not comment_body or not comment_body.startswith("/"):
+    if not comment_body:
+        return
+
+    normalized_comment = comment_body.strip().lower()
+    if await _maybe_handle_brain_chat(body, normalized_comment):
+        return
+
+    if not comment_body.startswith("/"):
         return
 
     pr_url = body.get("pull_request", {}).get("url")
@@ -286,6 +309,60 @@ def should_process_pr_logic(body) -> bool:
     except Exception as e:
         get_logger().error(f"Failed 'should_process_pr_logic': {e}")
     return True
+
+
+async def _maybe_handle_brain_chat(body: Dict[str, Any], normalized_comment: str) -> bool:
+    if normalized_comment in BRAIN_STATUS_COMMANDS:
+        result = await handle_status_query()
+        await _publish_brain_comment(body, _format_brain_reply(result, "Brain MCP is not enabled."))
+        return True
+
+    if normalized_comment in BRAIN_NEXT_COMMANDS:
+        result = await handle_next_actions_query(max_actions=5)
+        await _publish_brain_comment(body, _format_brain_reply(result, "Brain MCP is not enabled."))
+        return True
+
+    return False
+
+
+def _format_brain_reply(result: Dict[str, Any], fallback: str) -> str:
+    if not isinstance(result, dict):
+        return fallback
+    summary = result.get("summary_text") or result.get("headline")
+    return summary or fallback
+
+
+async def _publish_brain_comment(body: Dict[str, Any], message: str) -> None:
+    pr_url = _get_pr_api_url(body)
+    if not pr_url:
+        get_logger().error("Unable to determine PR URL for Brain chat response")
+        return
+
+    text = message or "Brain MCP response unavailable."
+
+    def _publish() -> None:
+        provider = GiteaProvider(pr_url)
+        provider.publish_comment(text)
+
+    await asyncio.to_thread(_publish)
+
+
+def _get_pr_api_url(body: Dict[str, Any]) -> Optional[str]:
+    pull_request_url = body.get("pull_request", {}).get("url")
+    if pull_request_url:
+        return pull_request_url
+
+    issue_pr = body.get("issue", {}).get("pull_request", {})
+    if isinstance(issue_pr, dict):
+        url = issue_pr.get("url")
+        if url:
+            return url
+
+    comment_pr_url = body.get("comment", {}).get("pull_request_url")
+    if comment_pr_url:
+        return comment_pr_url
+
+    return None
 
 # FastAPI app setup
 middleware = [Middleware(RawContextMiddleware)]

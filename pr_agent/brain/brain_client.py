@@ -179,3 +179,54 @@ class BrainClientWrapper:
             "slice": slice_name,
             "module_id": module_id
         })
+
+    async def get_hotspots_overview(
+        self,
+        slice_filter: Optional[str] = None,
+        limit: Optional[int] = None,
+        min_risk_score: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        args: Dict[str, Any] = {}
+        if slice_filter:
+            args["slice"] = slice_filter
+        if limit is not None:
+            args["limit"] = limit
+        if min_risk_score is not None:
+            args["min_risk_score"] = min_risk_score
+
+        return await self._call_tool_safe("get_hotspots_overview", args)
+
+    async def get_change_bundle_suggestions(
+        self,
+        slice_name: str,
+        module_ids: Optional[List[str]] = None,
+        paths: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        args: Dict[str, Any] = {"slice": slice_name}
+        if module_ids:
+            args["module_ids"] = module_ids
+        if paths:
+            args["paths"] = paths
+        if limit is not None:
+            args["limit"] = limit
+
+        return await self._call_tool_safe("get_change_bundle_suggestions", args)
+
+    async def get_status_overview(self, top_n_risks: int = 5) -> Optional[Dict[str, Any]]:
+        """Fetch overall Brain MCP status snapshot."""
+        return await self._call_tool_safe("get_status_overview", {
+            "top_n_risks": top_n_risks
+        })
+
+    async def get_next_actions(
+        self,
+        slice_filter: Optional[str] = None,
+        max_actions: int = 5
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch prioritized next actions from Brain MCP."""
+        args: Dict[str, Any] = {"max_actions": max_actions}
+        if slice_filter:
+            args["slice"] = slice_filter
+
+        return await self._call_tool_safe("get_next_actions", args)

@@ -27,20 +27,10 @@ async def prepare_brain_context(
     repo_path: Path,
     task_scope: Literal["pull_request", "issue_comment"],
 ) -> BrainContextResult:
-    """
-    Prepare Brain MCP context for a PR.
-
-    1. Identify impacted modules.
-    2. Query Brain MCP for CI status, validation status, contracts, and risks.
-    3. Write BRAIN_QODO_CONTEXT.md.
-    4. Return extra_instructions.
-    """
+    """Prepare Brain MCP context for a PR using composite tools."""
     settings = get_settings()
-    # Dynaconf exposes [brain] config as an object with attributes like
-    # brain.mcp_enable, brain.mcp_default_slice, etc.
     mcp_enable = getattr(settings.brain, "mcp_enable", False)
     if not mcp_enable:
-        # Bridge is explicitly disabled via config; do not attempt to talk to Brain MCP
         return BrainContextResult(status="unavailable", extra_instructions="")
 
     context_file = repo_path / "BRAIN_QODO_CONTEXT.md"
@@ -50,9 +40,15 @@ async def prepare_brain_context(
             if not client.client:
                 return _handle_unavailable(context_file, "Brain MCP client failed to initialize")
 
-            # 1. Get Change Impact (to find modules)
-            # We assume changed_files are relative to repo root, which is what Brain MCP expects.
             default_slice = getattr(settings.brain, "mcp_default_slice", "runtime")
+            max_modules = getattr(settings.brain, "mcp_max_modules", 5)
+            max_risks = getattr(settings.brain, "mcp_max_risks", 8)
+            usage_slice = getattr(settings.brain, "usage_slice", None) or default_slice
+            hotspot_limit = getattr(settings.brain, "usage_hotspot_limit", max_modules)
+            hotspot_min_score = getattr(settings.brain, "usage_min_risk_score", None)
+            bundle_limit = getattr(settings.brain, "usage_bundle_limit", 5)
+
+            status_overview = await client.get_status_overview(top_n_risks=max_risks)
 
             change_impact = await client._call_tool_safe(
                 "get_change_impact",
@@ -64,59 +60,58 @@ async def prepare_brain_context(
                 },
             )
 
-            impacted_modules = []
-            if change_impact and "impacted_modules" in change_impact:
-                impacted_modules = change_impact["impacted_modules"]
+            impacted_modules: List[str] = []
+            if change_impact:
+                if "resolved_modules" in change_impact:
+                    impacted_modules = [
+                        mod.get("module_id")
+                        for mod in change_impact.get("resolved_modules", [])
+                        if mod.get("module_id")
+                    ]
+                elif "impacted_modules" in change_impact:
+                    impacted_modules = change_impact["impacted_modules"]
 
-            # Limit modules
-            max_modules = getattr(settings.brain, "mcp_max_modules", 5)
-            top_modules = impacted_modules[:max_modules]
+            impacted_modules = impacted_modules[:max_modules]
 
-            # 2. Get CI and Validation Status
-            ci_summary = await client.get_ci_run_summary()
-            validation_status = await client.get_brain_validation_status()
+            hotspots_overview = await client.get_hotspots_overview(
+                slice_filter=usage_slice,
+                limit=hotspot_limit,
+                min_risk_score=hotspot_min_score,
+            )
 
-            # 3. Get Details for Top Modules
-            module_details = []
-            for mod_id in top_modules:
-                contract = await client.get_module_contract(mod_id, default_slice)
-                risks = await client.get_module_risks(mod_id, default_slice)
-                module_details.append({
-                    "id": mod_id,
-                    "contract": contract,
-                    "risks": risks,
-                })
+            bundle_suggestions = None
+            if impacted_modules or pr_meta.changed_files:
+                bundle_suggestions = await client.get_change_bundle_suggestions(
+                    slice_name=usage_slice,
+                    module_ids=impacted_modules or None,
+                    paths=pr_meta.changed_files or None,
+                    limit=bundle_limit,
+                )
 
-            # 4. Generate Content
-            max_risks = getattr(settings.brain, "mcp_max_risks", 8)
-
-            markdown_content = _generate_markdown(
+            markdown_content = _generate_markdown_v2(
                 pr_meta.pr_number,
-                ci_summary,
-                validation_status,
-                module_details,
+                status_overview,
+                change_impact,
+                impacted_modules,
+                hotspots_overview,
+                bundle_suggestions,
                 max_risks,
             )
 
-            instructions = _generate_instructions(
-                ci_summary,
-                validation_status,
-                module_details,
-                max_risks,
+            instructions = _generate_instructions_v2(
+                status_overview,
+                change_impact,
+                impacted_modules,
+                hotspots_overview,
+                bundle_suggestions,
             )
 
-            # Write file
             try:
                 context_file.write_text(markdown_content)
             except Exception as e:
                 logger.error(f"Failed to write BRAIN_QODO_CONTEXT.md: {e}")
-                # We continue, but status might be partial if we couldn't write file?
-                # Actually if we can't write file, Qodo won't see it.
-                # But we can still return instructions.
 
-            status = "ok"
-            if not ci_summary or not validation_status or (top_modules and not module_details):
-                status = "partial"
+            status = "ok" if status_overview else "partial"
 
             return BrainContextResult(
                 status=status,
@@ -149,122 +144,130 @@ Reviewer, you MUST:
 """
     return BrainContextResult(status="unavailable", extra_instructions=instructions)
 
-def _generate_markdown(
+def _generate_markdown_v2(
     pr_number: int,
-    ci_summary: Optional[Dict[str, Any]],
-    validation_status: Optional[Dict[str, Any]],
-    module_details: List[Dict[str, Any]],
-    max_risks: int
+    status_overview: Optional[Dict[str, Any]],
+    change_impact: Optional[Dict[str, Any]],
+    impacted_modules: List[str],
+    max_risks: int,
 ) -> str:
-    # Helpers
-    ci_status = "UNKNOWN"
-    failing_jobs = []
-    if ci_summary:
-        ci_status = ci_summary.get("overall_status", "UNKNOWN")
-        for job in ci_summary.get("jobs", []):
-            if job.get("last_run_status") != "success":
-                failing_jobs.append(job.get("name", "unknown"))
+    if not status_overview:
+        return f"""# Brain MCP snapshot for PR #{pr_number}
 
-    brain_status = "UNKNOWN"
-    failing_validators = []
-    if validation_status:
-        brain_status = validation_status.get("overall_status", "UNKNOWN")
-        for slice_entry in validation_status.get("slices", []):
-            if slice_entry.get("status") != "passed":
-                failing_validators.append(slice_entry.get("slice", "unknown"))
+Brain MCP is unavailable. Using standard review practices.
+"""
 
-    overall_status = "OK"
-    if ci_status != "success" or brain_status != "passed":
-        overall_status = "FAIL" if (ci_status == "failure" or brain_status == "failed") else "PARTIAL"
+    overall_status = status_overview.get("overall_status", "unknown")
+    quality_gate = status_overview.get("quality_gate")
+    ci_drift = status_overview.get("ci_drift")
 
     md = f"# Brain MCP snapshot for PR #{pr_number}\n\n"
-    md += f"- CI / Brain overall status: **{overall_status}**\n"
+    md += f"- **Overall codebase status**: {overall_status.upper()}\n"
 
-    if failing_jobs:
-        md += f"- Notable failing jobs: {', '.join(failing_jobs)}\n"
+    if quality_gate:
+        qg_state = quality_gate.get("state", "unknown")
+        failed_jobs = quality_gate.get("failed_jobs", [])
+        md += f"- **Quality gate (main)**: {qg_state}\n"
+        if failed_jobs:
+            md += f"  - Failed jobs: {', '.join(failed_jobs)}\n"
+
+    if ci_drift:
+        degraded_count = ci_drift.get("degraded_count", 0)
+        md += f"- **CI drift detected**: {degraded_count} jobs with failures/drift\n"
+
+    md += "\n## Codebase Health by Slice\n\n"
+    for slice_status in status_overview.get("by_slice", []):
+        slice_name = slice_status.get("slice", "unknown")
+        val_status = slice_status.get("validation_status", "unknown")
+        risk_count = slice_status.get("risk_count", 0)
+        top_severity = slice_status.get("top_risk_severity")
+        md += f"- **{slice_name}**: validation={val_status}, risks={risk_count}"
+        if top_severity is not None:
+            md += f", max_severity={top_severity}"
+        md += "\n"
+
+    md += "\n## PR-Specific Impact\n\n"
+    if impacted_modules:
+        md += f"This PR impacts {len(impacted_modules)} module(s):\n"
+        for mod in impacted_modules:
+            md += f"- `{mod}`\n"
     else:
-        md += "- Notable failing jobs: None\n"
+        md += "No high-impact modules identified.\n"
 
-    if failing_validators:
-        md += f"- Notable failing Brain validators: {', '.join(failing_validators)}\n"
+    md += "\n## Risks Relevant to This PR\n\n"
+    if change_impact and "risks" in change_impact:
+        pr_risks = change_impact.get("risks", [])
+        if pr_risks:
+            for risk_summary in pr_risks[:max_risks]:
+                mod_id = risk_summary.get("module_id", "unknown")
+                risks = risk_summary.get("risks", [])
+                if risks:
+                    md += f"### Module: `{mod_id}`\n\n"
+                    for risk in risks[:3]:
+                        md += (
+                            f"- **[{risk.get('id', 'unknown')}]** (severity={risk.get('severity', 'N/A')}): "
+                            f"{risk.get('recommended_action', 'No recommended action')}\n"
+                        )
+                    md += "\n"
+        else:
+            md += "No critical risks found in impacted modules.\n"
     else:
-        md += "- Notable failing Brain validators: None\n"
+        md += "Risk data unavailable.\n"
 
-    md += "\n## Impacted modules\n\n"
-    if not module_details:
-        md += "No high-impact modules identified or Brain data unavailable.\n"
-    else:
-        for mod in module_details:
-            mod_id = mod["id"]
-            contract = mod["contract"]
-            risks_data = mod["risks"]
-
-            contract_summary = "No contract available."
-            if contract and "summary" in contract:
-                contract_summary = contract.get("summary", "")
-
-            md += f"- **{mod_id}**\n"
-            md += f"  - Contract: {contract_summary}\n"
-
-            risks_list = []
-            if risks_data and "risks" in risks_data:
-                all_risks = risks_data["risks"]
-                # Filter/sort risks? For now take top N
-                risks_list = all_risks[:max_risks]
-
-            if risks_list:
-                md += "  - Known critical risks:\n"
-                for r in risks_list:
-                    rid = r.get("id", "unknown")
-                    title = r.get("title", "No title")
-                    md += f"    - [{rid}] {title}\n"
-            else:
-                md += "  - Known critical risks: None\n"
+    md += "\n## Top Actions (Global)\n\n"
+    top_actions = status_overview.get("top_actions", [])
+    if top_actions:
+        for action in top_actions[:5]:
+            priority = action.get("priority", "P2")
+            risk_id = action.get("risk_id", "unknown")
+            summary = action.get("summary", "")
+            estimate = action.get("estimate", "")
+            md += f"- **{priority}** [{risk_id}]: {summary}"
+            if estimate:
+                md += f" (est: {estimate})"
             md += "\n"
+    else:
+        md += "No recommended actions.\n"
 
-    md += "## Notes\n\n"
-    md += "- This snapshot is generated automatically by the Brain–Qodo bridge.\n"
-    md += "- If it is missing or incomplete, Qodo should state this limitation explicitly.\n"
+    md += "\n---\n\n"
+    md += "_This snapshot is generated automatically by the Brain–Qodo bridge._\n"
 
     return md
 
-def _generate_instructions(
-    ci_summary: Optional[Dict[str, Any]],
-    validation_status: Optional[Dict[str, Any]],
-    module_details: List[Dict[str, Any]],
-    max_risks: int
+
+def _generate_instructions_v2(
+    status_overview: Optional[Dict[str, Any]],
+    change_impact: Optional[Dict[str, Any]],
+    impacted_modules: List[str],
 ) -> str:
-    # Summarize for instructions
-    ci_status = "UNKNOWN"
-    failed_jobs_count = 0
-    if ci_summary:
-        ci_status = ci_summary.get("overall_status", "UNKNOWN")
-        failed_jobs_count = len([j for j in ci_summary.get("jobs", []) if j.get("last_run_status") != "success"])
+    if not status_overview:
+        return """Brain MCP context is UNAVAILABLE for this PR.\nReviewer: rely solely on the diff and standard best practices."""
 
-    brain_status = "UNKNOWN"
-    failed_slices = []
-    if validation_status:
-        brain_status = validation_status.get("overall_status", "UNKNOWN")
-        failed_slices = [s.get("slice") for s in validation_status.get("slices", []) if s.get("status") != "passed"]
+    overall_status = status_overview.get("overall_status", "unknown")
+    quality_gate = status_overview.get("quality_gate", {})
+    qg_state = quality_gate.get("state", "unknown")
 
-    impacted_ids = [m["id"] for m in module_details]
-
-    all_risk_ids = []
-    for m in module_details:
-        if m["risks"] and "risks" in m["risks"]:
-            for r in m["risks"]["risks"][:max_risks]:
-                all_risk_ids.append(r.get("id"))
-
-    # Construct string
     lines = ["Brain MCP context for this PR:"]
-    lines.append(f"- Overall Brain status: {brain_status} (Failing slices: {', '.join(failed_slices) if failed_slices else 'None'})")
-    lines.append(f"- CI summary: {ci_status} ({failed_jobs_count} failing jobs)")
-    lines.append(f"- Impacted modules: {', '.join(impacted_ids) if impacted_ids else 'None'}")
-    lines.append(f"- Critical risks in scope: {', '.join(all_risk_ids) if all_risk_ids else 'None'}")
+    lines.append(f"- Overall codebase status: {overall_status}")
+    lines.append(f"- Quality gate (main): {qg_state}")
+    lines.append(f"- PR impacts {len(impacted_modules)} module(s): {', '.join(impacted_modules[:3]) if impacted_modules else 'None'}")
+
+    p0_count = 0
+    if change_impact and "risks" in change_impact:
+        for risk_summary in change_impact.get("risks", []):
+            for risk in risk_summary.get("risks", []):
+                if risk.get("priority") == "P0" or risk.get("severity", 0) >= 4:
+                    p0_count += 1
+
+    if p0_count > 0:
+        lines.append(f"- **WARNING**: {p0_count} P0/critical risk(s) in impacted modules")
 
     lines.append("\nReviewer, you MUST:")
-    lines.append("- Prioritize issues that affect these modules and risks.")
-    lines.append("- Explicitly mention if you rely on this Brain snapshot.")
-    lines.append("- If Brain MCP is unavailable, clearly say so and limit your claims.")
+    lines.append("- Prioritize issues that affect the impacted modules and their risks")
+    lines.append("- Explicitly mention if you rely on this Brain snapshot")
+    lines.append("- If data is incomplete, clearly state limitations")
+
+    if overall_status == "fail" or qg_state == "failed":
+        lines.append("\n**CRITICAL**: Quality gate is FAILING. Extra scrutiny required.")
 
     return "\n".join(lines)
