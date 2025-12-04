@@ -1,6 +1,7 @@
 import copy
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
@@ -156,15 +157,19 @@ async def handle_comment_event(body: Dict[str, Any], event: str, action: str, ag
 
 async def _perform_commands_gitea(commands_conf: str, agent: PRAgent, body: dict, api_url: str):
     apply_repo_settings(api_url)
-    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:  # auto commands for PR, and auto feedback is disabled
+    settings = get_settings()
+
+    if commands_conf == "pr_commands" and settings.config.disable_auto_feedback:  # auto commands for PR, and auto feedback is disabled
         get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {api_url=}")
         return
-    if not should_process_pr_logic(body): # Here we already updated the configuration with the repo settings
+    if not should_process_pr_logic(body):  # Here we already updated the configuration with the repo settings
         return {}
 
     # --- Brain MCP Integration ---
     try:
-        if get_settings().get("brain.mcp_enable", False):
+        brain_settings = getattr(settings, "brain", None)
+        mcp_enable = getattr(brain_settings, "mcp_enable", False) if brain_settings is not None else False
+        if mcp_enable:
             # Extract PR details
             pr = body.get("pull_request", {})
             pr_number = pr.get("number")
@@ -186,14 +191,14 @@ async def _perform_commands_gitea(commands_conf: str, agent: PRAgent, body: dict
                 # mcp_root is the repo root (e.g., /opt/prism-rust)
                 # We use it both as the repo_path for writing BRAIN_QODO_CONTEXT.md
                 # and the client will derive .brain from it
-                mcp_root = get_settings().get("brain.mcp_root")
+                mcp_root = getattr(brain_settings, "mcp_root", None) if brain_settings is not None else None
                 if mcp_root:
                     repo_path = Path(mcp_root)  # Repo root, not .brain
                     pr_meta = PRMetadata(
                         pr_number=pr_number,
                         head_sha=head_sha,
                         base_sha=base_sha,
-                        changed_files=changed_files
+                        changed_files=changed_files,
                     )
 
                     get_logger().info(f"Preparing Brain context for PR #{pr_number}")
@@ -203,9 +208,9 @@ async def _perform_commands_gitea(commands_conf: str, agent: PRAgent, body: dict
                         get_logger().info("Injecting Brain extra instructions")
                         # Append to existing instructions for relevant tools
                         for tool in ["pr_reviewer", "pr_code_suggestions"]:
-                            current = get_settings().get(f"{tool}.extra_instructions", "")
+                            current = settings.get(f"{tool}.extra_instructions", "")
                             new_instr = f"{current}\n\n{brain_result.extra_instructions}"
-                            get_settings().set(f"{tool}.extra_instructions", new_instr)
+                            settings.set(f"{tool}.extra_instructions", new_instr)
     except Exception as e:
         get_logger().error(f"Failed to prepare Brain context: {e}")
     # -----------------------------
