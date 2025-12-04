@@ -1,6 +1,7 @@
 import copy
 import datetime
 import traceback
+import yaml
 from collections import OrderedDict
 from functools import partial
 from typing import List, Tuple
@@ -11,6 +12,7 @@ from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
                                          get_pr_diff,
+                                         get_pr_multi_diffs,
                                          retry_with_fallback_models)
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import (ModelType, PRReviewHeader,
@@ -187,6 +189,22 @@ class PRReviewer:
         return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
 
     async def _prepare_prediction(self, model: str) -> None:
+        """
+        Prepare the AI prediction for the PR review.
+
+        If enable_multi_diff is true and the diff exceeds model limits,
+        the diff is split into chunks, each chunk is reviewed separately,
+        and the results are merged into a single prediction.
+        """
+        enable_multi_diff = get_settings().pr_reviewer.get('enable_multi_diff', False)
+
+        if enable_multi_diff:
+            await self._prepare_prediction_multi_diff(model)
+        else:
+            await self._prepare_prediction_single_diff(model)
+
+    async def _prepare_prediction_single_diff(self, model: str) -> None:
+        """Original single-diff prediction mode."""
         self.patches_diff = get_pr_diff(self.git_provider,
                                         self.token_handler,
                                         model,
@@ -195,23 +213,238 @@ class PRReviewer:
 
         if self.patches_diff:
             get_logger().debug(f"PR diff", diff=self.patches_diff)
-            self.prediction = await self._get_prediction(model)
+            self.prediction = await self._get_prediction(model, self.patches_diff)
         else:
             get_logger().warning(f"Empty diff for PR: {self.pr_url}")
             self.prediction = None
 
-    async def _get_prediction(self, model: str) -> str:
+    async def _prepare_prediction_multi_diff(self, model: str) -> None:
+        """
+        Multi-diff prediction mode for large PRs.
+
+        Splits the diff into multiple chunks using get_pr_multi_diffs,
+        reviews each chunk separately, and merges the results.
+        """
+        max_diff_calls = get_settings().pr_reviewer.get('max_diff_calls', 3)
+
+        # Get diff chunks
+        diff_chunks = get_pr_multi_diffs(
+            self.git_provider,
+            self.token_handler,
+            model,
+            max_calls=max_diff_calls,
+            add_line_numbers=True
+        )
+
+        if not diff_chunks:
+            get_logger().warning(f"Empty diff chunks for PR: {self.pr_url}")
+            self.prediction = None
+            return
+
+        get_logger().info(f"Multi-diff mode: processing {len(diff_chunks)} chunk(s)")
+
+        # If only one chunk, use standard flow
+        if len(diff_chunks) == 1:
+            self.patches_diff = diff_chunks[0]
+            get_logger().debug(f"PR diff (single chunk)", diff=self.patches_diff)
+            self.prediction = await self._get_prediction(model, self.patches_diff)
+            return
+
+        # Process each chunk and collect parsed reviews
+        chunk_reviews = []
+        for i, chunk in enumerate(diff_chunks):
+            try:
+                get_logger().debug(f"Processing chunk {i+1}/{len(diff_chunks)}")
+                response = await self._get_prediction(model, chunk)
+
+                # Parse the response
+                parsed = load_yaml(
+                    response.strip(),
+                    keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:",
+                                   "security_concerns:", "key_issues_to_review:",
+                                   "relevant_file:", "relevant_line:", "suggestion:"],
+                    first_key='review',
+                    last_key='security_concerns'
+                )
+
+                if parsed and 'review' in parsed:
+                    chunk_reviews.append(parsed)
+                    get_logger().debug(f"Chunk {i+1} parsed successfully")
+                else:
+                    get_logger().warning(f"Chunk {i+1} yielded no valid 'review' key, skipping")
+
+            except Exception as e:
+                get_logger().warning(f"Failed to process chunk {i+1}: {e}")
+                # Continue with remaining chunks rather than failing entirely
+                continue
+
+        if not chunk_reviews:
+            get_logger().error("All chunks failed to parse, cannot produce review")
+            self.prediction = None
+            return
+
+        # Merge chunk reviews
+        merged = self._merge_review_chunks(chunk_reviews)
+        if merged:
+            # Convert merged dict back to YAML string for compatibility with _prepare_pr_review
+            self.prediction = yaml.dump(merged, default_flow_style=False, allow_unicode=True)
+            # Store original diff (first chunk) for logging purposes
+            self.patches_diff = diff_chunks[0]
+            get_logger().info(f"Successfully merged {len(chunk_reviews)} chunk reviews")
+        else:
+            get_logger().error("Failed to merge chunk reviews")
+            self.prediction = None
+
+    def _merge_review_chunks(self, chunk_reviews: List[dict]) -> dict:
+        """
+        Merge multiple per-chunk review dicts into a single coherent review.
+
+        Strategy:
+        - Scalar fields: use worst/most conservative value
+        - List fields: concatenate and de-duplicate by file+line
+
+        Args:
+            chunk_reviews: List of parsed review dicts, each with 'review' key
+
+        Returns:
+            Merged review dict compatible with _prepare_pr_review
+        """
+        if not chunk_reviews:
+            return None
+
+        if len(chunk_reviews) == 1:
+            return chunk_reviews[0]
+
+        merged = {'review': {}}
+
+        # === Scalar fields: take worst/most conservative value ===
+
+        # Effort to review: take maximum (worst case)
+        efforts = []
+        for cr in chunk_reviews:
+            effort = cr.get('review', {}).get('estimated_effort_to_review_[1-5]', '')
+            if effort:
+                try:
+                    # Handle format like "3, because..." or just "3"
+                    effort_str = str(effort).split(',')[0].strip()
+                    efforts.append(int(effort_str))
+                except (ValueError, IndexError):
+                    pass
+        if efforts:
+            max_effort = max(efforts)
+            merged['review']['estimated_effort_to_review_[1-5]'] = f"{max_effort}, aggregated from {len(chunk_reviews)} review chunks"
+
+        # Score: take minimum (worst case - lower score = worse)
+        scores = []
+        for cr in chunk_reviews:
+            score = cr.get('review', {}).get('score', '')
+            if score:
+                try:
+                    # Handle format like "75" or "75/100" or "75, good overall"
+                    score_str = str(score).split(',')[0].split('/')[0].strip()
+                    scores.append(int(score_str))
+                except (ValueError, IndexError):
+                    pass
+        if scores:
+            min_score = min(scores)
+            merged['review']['score'] = f"{min_score}, aggregated from {len(chunk_reviews)} review chunks"
+
+        # Security concerns: OR logic (if any chunk has concerns, report it)
+        security_values = []
+        for cr in chunk_reviews:
+            sec = cr.get('review', {}).get('security_concerns', '')
+            if sec:
+                security_values.append(str(sec).strip())
+
+        if security_values:
+            has_security_concern = any(
+                'yes' in v.lower() or 'true' in v.lower()
+                for v in security_values if v.lower() not in ['no', 'false', 'n/a', 'none', '']
+            )
+            if has_security_concern:
+                # Collect all non-empty security concerns
+                concerns = [v for v in security_values if v.lower() not in ['no', 'false', 'n/a', 'none', '']]
+                merged['review']['security_concerns'] = "Yes. " + " | ".join(concerns[:3])  # Limit to avoid too long
+            else:
+                merged['review']['security_concerns'] = "No"
+
+        # Relevant tests: OR logic
+        test_values = []
+        for cr in chunk_reviews:
+            tests = cr.get('review', {}).get('relevant_tests', '')
+            if tests:
+                test_values.append(str(tests).strip())
+        if test_values:
+            has_tests = any('yes' in v.lower() for v in test_values)
+            merged['review']['relevant_tests'] = 'Yes' if has_tests else 'No'
+
+        # Possible issues: collect all
+        issue_values = []
+        for cr in chunk_reviews:
+            issues = cr.get('review', {}).get('possible_issues', '')
+            if issues and str(issues).strip().lower() not in ['no', 'none', 'n/a', '']:
+                issue_values.append(str(issues).strip())
+        merged['review']['possible_issues'] = " | ".join(issue_values) if issue_values else "No"
+
+        # === List fields: concatenate and de-duplicate ===
+
+        # Key issues to review
+        all_key_issues = []
+        seen_issues = set()
+        for cr in chunk_reviews:
+            issues = cr.get('review', {}).get('key_issues_to_review', [])
+            if isinstance(issues, list):
+                for issue in issues:
+                    # De-duplicate by file + line range
+                    if isinstance(issue, dict):
+                        key = (issue.get('relevant_file', ''),
+                               issue.get('start_line', 0),
+                               issue.get('end_line', 0))
+                        if key not in seen_issues:
+                            seen_issues.add(key)
+                            all_key_issues.append(issue)
+        if all_key_issues:
+            merged['review']['key_issues_to_review'] = all_key_issues
+
+        # Ticket compliance check
+        all_tickets = []
+        seen_tickets = set()
+        for cr in chunk_reviews:
+            tickets = cr.get('review', {}).get('ticket_compliance_check', [])
+            if isinstance(tickets, list):
+                for ticket in tickets:
+                    if isinstance(ticket, dict):
+                        ticket_url = ticket.get('ticket_url', '')
+                        if ticket_url and ticket_url not in seen_tickets:
+                            seen_tickets.add(ticket_url)
+                            all_tickets.append(ticket)
+        if all_tickets:
+            merged['review']['ticket_compliance_check'] = all_tickets
+
+        # Can be split - merge all suggestions
+        all_splits = []
+        for cr in chunk_reviews:
+            splits = cr.get('review', {}).get('can_be_split', [])
+            if isinstance(splits, list):
+                all_splits.extend(splits)
+        if all_splits:
+            merged['review']['can_be_split'] = all_splits
+
+        return merged
+
+    async def _get_prediction(self, model: str, diff: str = None) -> str:
         """
         Generate an AI prediction for the pull request review.
 
         Args:
             model: A string representing the AI model to be used for the prediction.
+            diff: Optional diff string. If not provided, uses self.patches_diff.
 
         Returns:
             A string representing the AI prediction for the pull request review.
         """
         variables = copy.deepcopy(self.vars)
-        variables["diff"] = self.patches_diff  # update diff
+        variables["diff"] = diff if diff is not None else self.patches_diff  # update diff
 
         environment = Environment(undefined=StrictUndefined)
         system_prompt = environment.from_string(get_settings().pr_review_prompt.system).render(variables)
@@ -376,7 +609,20 @@ class PRReviewer:
             try:
                 review_labels = []
                 if get_settings().pr_reviewer.enable_review_labels_effort:
-                    estimated_effort = data['review']['estimated_effort_to_review_[1-5]']
+                    # Support variants in model output (with/without brackets or dash)
+                    effort_keys = [
+                        'estimated_effort_to_review_[1-5]',
+                        'estimated_effort_to_review_1-5',
+                        'estimated_effort_to_review',
+                    ]
+                    estimated_effort = None
+                    for key in effort_keys:
+                        if key in data.get('review', {}):
+                            estimated_effort = data['review'][key]
+                            break
+
+                    if estimated_effort is None:
+                        raise KeyError("estimated effort key not found in review output")
                     estimated_effort_number = 0
                     if isinstance(estimated_effort, str):
                         try:

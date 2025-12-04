@@ -1,3 +1,19 @@
+[config]
+# Local model defaults for production deployment
+model = "local-qwen25-coder-7b"
+max_model_tokens = 14000
+custom_model_max_tokens = 14000
+temperature = 0.15
+
+[openai]
+# Point to local llama.cpp (adjust host if remote)
+api_base = "http://127.0.0.1:8000/v1"
+key = "local-qodo-secret"
+
 [pr_reviewer]
 enable_review_labels_effort = true
 enable_auto_approval = true
+
+# Enable multi-diff review mode by default
+enable_multi_diff = true
+max_diff_calls = 3

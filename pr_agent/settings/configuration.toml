@@ -100,6 +100,9 @@ minimal_commits_for_incremental_review=0
 minimal_minutes_for_incremental_review=0
 enable_intro_text=true
 enable_help_text=false # Determines whether to include help text in the PR review. Enabled by default.
+# Multi-diff mode for large PRs (Phase 1 - local review optimization)
+enable_multi_diff = false  # If true, split large diffs into chunks and merge reviews. Default: false (preserves current single-diff behavior)
+max_diff_calls = 3  # Maximum number of diff chunks to process when enable_multi_diff=true
 
 [pr_description] # /describe #
 publish_labels=false
