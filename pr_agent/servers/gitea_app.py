@@ -56,7 +56,7 @@ async def handle_gitea_webhooks(background_tasks: BackgroundTasks, request: Requ
     )
 
     # Set context for the request
-    context["settings"] = copy.deepcopy(global_settings)
+    context["settings"] = copy.deepcopy(get_settings())
     context["git_provider"] = {}
 
     # Handle the webhook in background
