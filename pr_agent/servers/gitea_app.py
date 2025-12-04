@@ -15,7 +15,7 @@ from pr_agent.brain.bridge import prepare_brain_context, PRMetadata
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.gitea_provider import GiteaProvider
 from pr_agent.git_providers.utils import apply_repo_settings
-from pr_agent.log import get_loggeringFormat, get_logger, setup_logger
+from pr_agent.log import LoggingFormat, get_logger, setup_logger
 from pr_agent.servers.utils import verify_signature
 
 # Setup logging and router
@@ -29,12 +29,37 @@ async def handle_gitea_webhooks(background_tasks: BackgroundTasks, request: Requ
 
     body = await get_body(request)
 
+    # Log basic shape of the incoming webhook for easier debugging.
+    # Some Gitea installations populate only X-GitHub-Event / X-Gogs-Event for
+    # compatibility, so we look at all three instead of assuming a single header.
+    event = (
+        request.headers.get("X-Gitea-Event")
+        or request.headers.get("X-Gogs-Event")
+        or request.headers.get("X-GitHub-Event")
+    )
+    try:
+        body_keys = list(body.keys()) if isinstance(body, dict) else []
+    except Exception:
+        body_keys = []
+    get_logger().info(
+        "Gitea webhook received",
+        artifact={
+            "event": event,
+            "headers": {
+                "X-Gitea-Event": request.headers.get("X-Gitea-Event"),
+                "X-Gogs-Event": request.headers.get("X-Gogs-Event"),
+                "X-GitHub-Event": request.headers.get("X-GitHub-Event"),
+            },
+            "body_keys": body_keys,
+        },
+    )
+
     # Set context for the request
     context["settings"] = copy.deepcopy(global_settings)
     context["git_provider"] = {}
 
     # Handle the webhook in background
-    background_tasks.add_task(handle_request, body, event=request.headers.get("X-Gitea-Event", None))
+    background_tasks.add_task(handle_request, body, event=event)
     return {}
 
 async def get_body(request: Request):
