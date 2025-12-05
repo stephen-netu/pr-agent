@@ -4,6 +4,9 @@ glob = [
     # Ignore files and directories matching these glob patterns.
     # See https://docs.python.org/3/library/glob.html
     'vendor/**',
+    'docs/**',
+    'book/**',
+    '**/*.md',
 ]
 regex = [
     # Ignore files and directories matching these regex patterns.

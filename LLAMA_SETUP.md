@@ -30,9 +30,9 @@ tail -n 40 /Users/netu/Logs/llama-server.log
 ## pr-agent config (repo-scoped)
 - File: `.pr_agent.toml` at repo root
 - Settings:
-  - `[config]` model `local-qwen25-coder-7b`, `max_model_tokens = 14000`, `custom_model_max_tokens = 14000`, `temperature = 0.15`
-  - `[openai]` `api_base = "http://127.0.0.1:8000/v1"`, `key = "local-qodo-secret"`
-  - `[pr_reviewer]` `enable_multi_diff = true`, `max_diff_calls = 3`
+  - `[config]` model `qwen2.5-coder-7b-instruct-q4_k_m.gguf`, `max_model_tokens = 12000`, `custom_model_max_tokens = 12000`, `temperature = 0.2`
+  - `[openai]` `api_base = "http://<mac-mini>:8000/v1"`, `key = "local-qodo-secret"`
+  - `[pr_reviewer]` `enable_multi_diff = true`, `max_diff_calls = 2`
 
 ## Quick validation
 - Unit tests: `python -m pytest tests/unittest/test_multi_diff_merge.py -v`

@@ -5,9 +5,9 @@
 # Use this page: 'https://qodo-merge-docs.qodo.ai/ai_search/' to ask questions about the configuration options.
 
 [config]
-# models
-model="gpt-5-2025-08-07"
-fallback_models=["o4-mini"]
+# models (local Mac mini endpoint)
+model="qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+fallback_models=[]
 #model_reasoning="o4-mini" # dedicated reasoning model for self-reflection
 #model_weak="gpt-4o" # optional, a weaker model to use for some easier tasks
 # CLI
@@ -27,11 +27,11 @@ ai_timeout=120 # 2minutes
 skip_keys = []
 custom_reasoning_model = false # when true, disables system messages and temperature controls for models that don't support chat-style inputs
 response_language="en-US" # Language locales code for PR responses in ISO 3166 and ISO 639 format (e.g., "en-US", "it-IT", "zh-CN", ...)
-# token limits
-max_description_tokens = 500
-max_commits_tokens = 500
-max_model_tokens = 32000 # Limits the maximum number of tokens that can be used by any model, regardless of the model's default capabilities.
-custom_model_max_tokens=-1 # for models not in the default list
+# token limits (keep small for local inference)
+max_description_tokens = 400
+max_commits_tokens = 400
+max_model_tokens = 12000 # Limits the maximum number of tokens that can be used by any model, regardless of the model's default capabilities.
+custom_model_max_tokens=12000 # for models not in the default list
 model_token_count_estimate_factor=0.3 # factor to increase the token count estimate, in order to reduce likelihood of model failure due to too many tokens - applicable only when requesting an accurate estimate.
 # patch extension logic
 patch_extension_skip_types =[".md",".txt"]
@@ -101,8 +101,8 @@ minimal_minutes_for_incremental_review=0
 enable_intro_text=true
 enable_help_text=false # Determines whether to include help text in the PR review. Enabled by default.
 # Multi-diff mode for large PRs (Phase 1 - local review optimization)
-enable_multi_diff = false  # If true, split large diffs into chunks and merge reviews. Default: false (preserves current single-diff behavior)
-max_diff_calls = 3  # Maximum number of diff chunks to process when enable_multi_diff=true
+enable_multi_diff = true  # If true, split large diffs into chunks and merge reviews.
+max_diff_calls = 2  # Maximum number of diff chunks to process when enable_multi_diff=true
 
 [pr_description] # /describe #
 publish_labels=false
